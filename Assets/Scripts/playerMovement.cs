@@ -41,6 +41,14 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] [Tooltip("Collider height during slide")] private float slideColliderHeight = 1f;
     [SerializeField] [Tooltip("Collider center Y during slide")] private float slideColliderCenterY = 0.5f;
     [SerializeField] [Tooltip("Duration of the slide in seconds")] private float slideDuration = 0.7f;
+    [SerializeField] [Tooltip("Distance horizontale parcourue pendant la glissade")] private float slideDistance = 3f;
+
+    // --- NOUVEAU : Variables pour la Roulade ---
+    [Header("Roll")]
+    [SerializeField] [Tooltip("Hauteur minimale de chute pour déclencher la roulade")] private float minFallHeightForRoll = 2f;
+    [SerializeField] [Tooltip("Durée de la roulade (doit correspondre à l'animation)")] private float rollDuration = 0.6f;
+    [SerializeField] [Tooltip("Distance parcourue pendant la roulade")] private float rollDistance = 2f;
+    // --- FIN NOUVEAU ---
 
     // Private Components
     private Rigidbody rb;
@@ -60,10 +68,16 @@ public class PlayerMovement : MonoBehaviour
     private bool canVault = false;
     private Collider vaultObstacle = null;
     private bool isWallJumping = false;
-    private bool IsSliding = false; // Note: 'I' majuscule to match Animator param
+    private bool IsSliding = false;
     private float originalColliderHeight;
     private Vector3 originalColliderCenter;
-    private Collider currentObstacle; // Used by vault coroutine
+    private Collider currentObstacle;
+
+    // --- NOUVEAU : Variables d'état pour la Roulade ---
+    private bool isFalling = false;
+    private float fallStartY;
+    private bool isRolling = false;
+    // --- FIN NOUVEAU ---
 
     #endregion
 
@@ -74,42 +88,22 @@ public class PlayerMovement : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         playerCollider = GetComponent<CapsuleCollider>();
         if (playerCollider == null) Debug.LogError("ERREUR : CapsuleCollider introuvable sur le Player !");
-
         audioSource = GetComponent<AudioSource>();
         if(audioSource == null) audioSource = gameObject.AddComponent<AudioSource>();
         audioSource.playOnAwake = false;
-
         if (characterModel == null && transform.childCount > 0) characterModel = transform.GetChild(0);
         if (characterModel != null) animator = characterModel.GetComponent<Animator>();
-
         if (animator != null) animator.applyRootMotion = false;
-
-        if (playerCollider != null)
-        {
-            originalColliderHeight = playerCollider.height;
-            originalColliderCenter = playerCollider.center;
-        }
-        else
-        {
-             originalColliderHeight = 2f;
-             originalColliderCenter = Vector3.up;
-             Debug.LogError("Utilisation de valeurs par défaut pour le collider car il n'a pas été trouvé!");
-        }
-
-
-        if (runningDustEffect != null)
-        {
-            GameObject dust = Instantiate(runningDustEffect, transform.position, Quaternion.identity, transform);
-            currentRunningDust = dust.GetComponent<ParticleSystem>();
-            if (currentRunningDust != null) currentRunningDust.Stop();
-        }
+        if (playerCollider != null) { originalColliderHeight = playerCollider.height; originalColliderCenter = playerCollider.center; }
+        else { originalColliderHeight = 2f; originalColliderCenter = Vector3.up; Debug.LogError("Utilisation de valeurs par défaut pour le collider!"); }
+        if (runningDustEffect != null) { GameObject dust = Instantiate(runningDustEffect, transform.position, Quaternion.identity, transform); currentRunningDust = dust.GetComponent<ParticleSystem>(); if (currentRunningDust != null) currentRunningDust.Stop(); }
         if (impulseSource == null && Camera.main != null) impulseSource = Camera.main.GetComponent<CinemachineImpulseSource>();
-
-        wasGrounded = isGrounded;
+        wasGrounded = isGrounded; // Important
     }
 
     void Update()
     {
+        // --- MODIFIÉ : Ajouter le verrouillage 'isRolling' ---
         HandleRawInput();
         HandleRotation();
         HandleActionInput();
@@ -120,27 +114,70 @@ public class PlayerMovement : MonoBehaviour
         HandleRunningDust();
     }
 
-
     void FixedUpdate()
     {
-        HandleHorizontalMovement();
+        // --- MODIFIÉ : Ajouter le verrouillage 'isRolling' ---
+        if (!IsSliding && !isRolling) HandleHorizontalMovement(); // La coroutine gère le mouvement pendant slide/roll
         HandleJumpExecution();
     }
 
     private void LateUpdate()
     {
-        wasGrounded = isGrounded;
+        // --- MODIFIÉ : Détection début de chute ---
+        // Si on était au sol la frame d'avant ET on ne l'est plus maintenant ET on n'est pas déjà marqué comme tombant
+        // ET on ne fait pas déjà une action (roulade, slide, walljump - pour éviter faux positifs)
+        if (wasGrounded && !isGrounded && !isFalling && !isRolling && !IsSliding && !isWallJumping)
+        {
+            isFalling = true;
+            fallStartY = transform.position.y; // Enregistre la hauteur de départ
+        }
+        // Si on touche le sol (et qu'on ne roule pas déjà), on n'est plus en train de tomber
+        // (le début de roulade mettra isFalling à false dans OnCollisionStay)
+        if(isGrounded && !isRolling)
+        {
+            isFalling = false;
+        }
+        // --- FIN MODIFIÉ ---
+
+        wasGrounded = isGrounded; // Met à jour l'état précédent pour la prochaine frame
         if(animator != null) animator.SetBool("IsGrounded", isGrounded);
     }
 
+
     private void OnCollisionStay(Collision collision)
     {
+        // On vérifie si l'objet touché est bien le sol ou un obstacle franchissable
         if (collision.gameObject.CompareTag("Ground") || collision.gameObject.CompareTag("Vault"))
         {
-            if (!wasGrounded && !isGrounded) TriggerLandingEffects();
-            isGrounded = true;
+            // --- MODIFIÉ : Logique d'atterrissage et déclenchement roulade ---
+            // On détecte la transition air -> sol UNIQUEMENT
+            if (!wasGrounded && !isGrounded)
+            {
+                // Joue les effets normaux (son, particules, shake)
+                TriggerLandingEffects();
+
+                // Vérifie si on était en train de tomber et si la chute est assez longue
+                if(isFalling) // 'isFalling' est mis à true dans LateUpdate
+                {
+                    float fallDistance = fallStartY - transform.position.y;
+                    // Déclenche la roulade si la chute est suffisante ET qu'on ne roule/glisse/saute pas déjà
+                    if (fallDistance > minFallHeightForRoll && !isRolling && !IsSliding && !isWallJumping)
+                    {
+                        StartCoroutine(DoRoll());
+                        isGrounded = true; // Force l'état au sol immédiatement
+                        isFalling = false; // La chute est terminée par la roulade
+                        // Ne met PAS à jour wasGrounded ici, LateUpdate s'en charge
+                        return; // On sort pour ne pas écraser l'état isGrounded ci-dessous inutilement
+                    }
+                }
+                 // Si on n'a pas roulé, on marque quand même la fin de la chute
+                isFalling = false;
+            }
+            // --- FIN MODIFIÉ ---
+            isGrounded = true; // Confirme qu'on est au sol si on reste en contact
         }
     }
+
 
     private void OnCollisionExit(Collision collision)
     {
@@ -155,27 +192,28 @@ public class PlayerMovement : MonoBehaviour
 
     void HandleRawInput()
     {
-        if (isWallJumping) moveInput = 0;
+        // --- MODIFIÉ : Ajouter isRolling ---
+        if (isWallJumping || IsSliding || isRolling) moveInput = 0;
         else moveInput = Input.GetAxis("P1_Horizontal");
     }
 
-
     void HandleActionInput()
     {
-        if (Input.GetButtonDown("P1_B1") && !IsSliding && !isWallJumping)
+        // --- MODIFIÉ : Ajouter !isRolling aux conditions ---
+        if (Input.GetButtonDown("P1_B1") && !IsSliding && !isWallJumping && !isRolling)
             jumpBufferCounter = jumpBufferTime;
 
-        if (Input.GetButtonDown("P1_B2") && isGrounded && !IsSliding && !isWallJumping && Mathf.Abs(moveInput) > 0.1f)
+        if (Input.GetButtonDown("P1_B2") && isGrounded && !IsSliding && !isWallJumping && Mathf.Abs(moveInput) > 0.1f && !isRolling)
         {
             IsSliding = true;
             StartCoroutine(DoSlide());
         }
     }
 
-
     void CheckEnvironmentStatus()
     {
-        if (isWallJumping || IsSliding) // Skip checks if busy
+        // --- MODIFIÉ : Ajouter isRolling ---
+        if (isWallJumping || IsSliding || isRolling) // Skip checks if busy
         {
             isAgainstWall = false; canVault = false; vaultObstacle = null; return;
         }
@@ -188,15 +226,16 @@ public class PlayerMovement : MonoBehaviour
         if (isAgainstWall && !isWallJumping) animator.SetFloat("Speed", 0);
         else animator.SetFloat("Speed", Mathf.Abs(moveInput));
         animator.SetBool("IsSliding", IsSliding);
+        // isRolling utilise le Trigger "DoRoll"
     }
-
 
     void HandleJumpStateLogic()
     {
         if (isGrounded) { coyoteTimeCounter = coyoteTime; if (isWallJumping) isWallJumping = false; }
         else { coyoteTimeCounter -= Time.deltaTime; }
 
-         if (Input.GetButtonDown("P1_B1") && canVault && !isWallJumping && !IsSliding)
+        // --- MODIFIÉ : Ajouter !isRolling ---
+         if (Input.GetButtonDown("P1_B1") && canVault && !isWallJumping && !IsSliding && !isRolling)
          {
              StartCoroutine(DoVault(vaultObstacle));
              jumpBufferCounter = 0f; coyoteTimeCounter = 0f;
@@ -207,83 +246,65 @@ public class PlayerMovement : MonoBehaviour
 
      void HandleRotation()
      {
-        // Allow rotation even when sliding now
-        if (!isWallJumping)
+        // --- MODIFIÉ : Ajouter isRolling ---
+        // Allow rotation only if not wall jumping or rolling
+        if (!isWallJumping && !isRolling)
         {
             if (moveInput > 0.01f && !isFacingRight) Flip();
             else if (moveInput < -0.01f && isFacingRight) Flip();
         }
     }
 
-    void Flip()
-    {
-        isFacingRight = !isFacingRight;
-        transform.Rotate(0f, 180f, 0f);
-    }
-
+    void Flip() { isFacingRight = !isFacingRight; transform.Rotate(0f, 180f, 0f); }
 
     void HandleVariableJumpCut()
     {
-        if (Input.GetButtonUp("P1_B1") && rb.velocity.y > 0)
+         if (Input.GetButtonUp("P1_B1") && rb.velocity.y > 0)
         {
             rb.velocity = new Vector3(rb.velocity.x, rb.velocity.y * jumpCutMultiplier, rb.velocity.z);
             coyoteTimeCounter = 0f;
         }
     }
-
     void HandleRunningDust()
     {
         if (currentRunningDust == null || animator == null) return;
-        bool isRunning = isGrounded && animator.GetFloat("Speed") > 0.1f && !IsSliding;
+        // --- MODIFIÉ : Ajouter isRolling ---
+        bool isRunning = isGrounded && animator.GetFloat("Speed") > 0.1f && !IsSliding && !isRolling;
         if (isRunning && !currentRunningDust.isPlaying) currentRunningDust.Play();
         else if (!isRunning && currentRunningDust.isPlaying) currentRunningDust.Stop();
     }
-
-
     #endregion
 
     #region Physics & Movement Execution
 
     void HandleHorizontalMovement()
     {
-        if (!isWallJumping && !IsSliding) // Apply velocity only if not wall jumping OR sliding
+        // Cette fonction n'est appelée que si on ne glisse PAS et on ne roule PAS
+        if (!isWallJumping)
         {
             if (isAgainstWall) rb.velocity = new Vector3(0, rb.velocity.y, 0);
             else rb.velocity = new Vector3(moveInput * moveSpeed, rb.velocity.y, 0);
         }
-        // If sliding, Drag slows player
     }
-
 
     void HandleJumpExecution()
     {
+       // ... (Ajoute check isRolling) ...
         if (jumpBufferCounter > 0f && coyoteTimeCounter > 0f && !(canVault && Input.GetButtonDown("P1_B1")))
         {
-            if (isAgainstWall) // Wall Jump
-            {
-                isWallJumping = true;
-                float jumpDirection = isFacingRight ? -1f : 1f;
-                rb.velocity = new Vector3(rb.velocity.x, 0, 0);
-                rb.AddForce(new Vector3(jumpDirection * wallJumpPushForce, jumpForce), ForceMode.Impulse);
-                Flip();
-                Invoke("StopWallJump", 0.3f);
-            }
-            else // Normal Jump
-            {
-                rb.velocity = new Vector3(rb.velocity.x, 0, rb.velocity.z);
-                rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
-            }
+            // --- MODIFIÉ : Ne pas sauter si on roule ---
+            if(isRolling) return;
+            // --- FIN MODIFIÉ ---
+
+            if (isAgainstWall) { /* ... Wall Jump ... */ isWallJumping = true; float d = isFacingRight?-1f:1f; rb.velocity=new Vector3(rb.velocity.x,0,0); rb.AddForce(new Vector3(d*wallJumpPushForce,jumpForce), ForceMode.Impulse); Flip(); Invoke("StopWallJump",0.3f); }
+            else { /* ... Normal Jump ... */ rb.velocity = new Vector3(rb.velocity.x,0,rb.velocity.z); rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse); }
             if(animator != null) animator.SetTrigger("Jump");
             jumpBufferCounter = 0f; coyoteTimeCounter = 0f;
             if (jumpSound != null && audioSource != null) audioSource.PlayOneShot(jumpSound);
         }
     }
 
-    private void StopWallJump()
-    {
-        isWallJumping = false;
-    }
-
+    private void StopWallJump() { isWallJumping = false; }
     #endregion
 
     #region Environment Checks
@@ -336,50 +357,72 @@ public class PlayerMovement : MonoBehaviour
         if(obstacleCollider != null) obstacleCollider.enabled = true;
     }
 
-
-    // Coroutine managing the slide state and collider changes
     private IEnumerator DoSlide()
     {
-        // IsSliding is set true immediately in HandleActionInput
+        IsSliding = true; // Déjà fait dans Update
 
         if (playerCollider != null)
         {
-            // Change collider
             playerCollider.height = slideColliderHeight;
             playerCollider.center = new Vector3(originalColliderCenter.x, slideColliderCenterY, originalColliderCenter.z);
         }
 
-        yield return new WaitForSeconds(slideDuration); // Wait
+        yield return new WaitForSeconds(slideDuration);
 
-        // Restore collider ONLY if we are still sliding
         if (IsSliding && playerCollider != null)
         {
             playerCollider.height = originalColliderHeight;
             playerCollider.center = originalColliderCenter;
+            IsSliding = false;
 
-            IsSliding = false; // Unlock state AFTER restoring collider
-
-            // --- NOUVEAU : Forcer la rotation à la fin ---
-            float currentMoveInput = Input.GetAxis("P1_Horizontal"); // Lire l'input actuel
-            if (currentMoveInput > 0.01f)
-            {
-                transform.rotation = Quaternion.Euler(0f, 0f, 0f); // Force vers la droite
-                isFacingRight = true;
-            }
-            else if (currentMoveInput < -0.01f)
-            {
-                transform.rotation = Quaternion.Euler(0f, 180f, 0f); // Force vers la gauche
-                isFacingRight = false;
-            }
-             // Si l'input est neutre, on garde la direction d'avant la glissade (implicite)
-            // --- FIN NOUVEAU ---
+            float currentMoveInput = Input.GetAxis("P1_Horizontal");
+            if (currentMoveInput > 0.01f) { transform.rotation = Quaternion.Euler(0f, 0f, 0f); isFacingRight = true; }
+            else if (currentMoveInput < -0.01f) { transform.rotation = Quaternion.Euler(0f, 180f, 0f); isFacingRight = false; }
         }
-        else if (playerCollider == null) // Safety check
-        {
-             IsSliding = false;
-        }
+        else if (playerCollider == null) { IsSliding = false; }
     }
 
+    // --- NOUVEAU : Coroutine pour la Roulade ---
+    private IEnumerator DoRoll()
+    {
+        isRolling = true; // Verrouille le joueur
+        // On rend Kinematic pour contrôler le mouvement précisément pendant la roulade
+        rb.isKinematic = true;
+        rb.velocity = Vector3.zero; // Stoppe toute vélocité existante
+        // Optionnel: désactiver le collider si l'animation passe à travers le sol
+        // if(playerCollider != null) playerCollider.enabled = false;
+
+        // Déclenche l'animation de roulade
+        if (animator != null) animator.SetTrigger("DoRoll");
+
+        // --- Mouvement Scripté pendant la roulade ---
+        float timer = 0f;
+        Vector3 startPos = transform.position;
+        Vector3 rollDirection = isFacingRight ? Vector3.right : Vector3.left;
+        Vector3 targetPos = startPos + rollDirection * rollDistance;
+
+        while (timer < rollDuration)
+        {
+            float t = timer / rollDuration;
+            // Interpole la position horizontalement, garde Y constant (au niveau de startPos)
+            transform.position = Vector3.Lerp(startPos, new Vector3(targetPos.x, startPos.y, targetPos.z), t);
+            timer += Time.deltaTime;
+            yield return null; // Attend la frame suivante
+        }
+        transform.position = new Vector3(targetPos.x, startPos.y, targetPos.z); // Assure la position finale
+        // --- Fin Mouvement Scripté ---
+
+        isRolling = false; // Déverrouille
+        rb.isKinematic = false; // Réactive la physique standard
+        // Optionnel: réactiver le collider
+        // if(playerCollider != null) playerCollider.enabled = true;
+
+        // Force la rotation correcte à la fin, basée sur l'input actuel
+        float currentMoveInput = Input.GetAxis("P1_Horizontal");
+        if (currentMoveInput > 0.01f) { transform.rotation = Quaternion.Euler(0f, 0f, 0f); isFacingRight = true; }
+        else if (currentMoveInput < -0.01f) { transform.rotation = Quaternion.Euler(0f, 180f, 0f); isFacingRight = false; }
+    }
+    // --- FIN NOUVEAU ---
 
     #endregion
 
